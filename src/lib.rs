@@ -34,6 +34,27 @@ pub fn match_template<'a>(
     matcher.wait_for_result().unwrap()
 }
 
+/// Slides a template over the input and scores the match at each point using the requested method.
+/// The mask image is used to ignore parts of the input image.
+/// 
+/// This is a shorthand for:
+/// ```ignore
+/// let mut matcher = TemplateMatcher::new();
+/// matcher.match_template_mask(input, template, mask, method);
+/// matcher.wait_for_result().unwrap()
+/// ```
+/// You can use  [find_extremes] to find minimum and maximum values, and their locations in the result image.
+pub fn match_template_mask<'a>(
+    input: impl Into<Image<'a>>,
+    template: impl Into<Image<'a>>,
+    mask: impl Into<Image<'a>>,
+    method: MatchTemplateMethod,
+) -> Image<'static> {
+    let mut matcher = TemplateMatcher::new();
+    matcher.match_template_mask(input, template, mask, method);
+    matcher.wait_for_result().unwrap()
+}
+
 /// Finds the smallest and largest values and their locations in an image.
 pub fn find_extremes(input: &Image<'_>) -> Extremes {
     let mut min_value = f32::MAX;
@@ -106,6 +127,8 @@ pub struct Extremes {
 struct ShaderUniforms {
     input_width: u32,
     input_height: u32,
+    mask_width: u32,
+    mask_height: u32,
     template_width: u32,
     template_height: u32,
 }
@@ -124,11 +147,13 @@ pub struct TemplateMatcher {
 
     last_input_size: (u32, u32),
     last_template_size: (u32, u32),
+    last_mask_size: (u32, u32),
     last_result_size: (u32, u32),
 
     uniform_buffer: wgpu::Buffer,
     input_buffer: Option<wgpu::Buffer>,
     template_buffer: Option<wgpu::Buffer>,
+    mask_buffer: Option<wgpu::Buffer>,
     result_buffer: Option<wgpu::Buffer>,
     staging_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
@@ -203,7 +228,7 @@ impl TemplateMatcher {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -211,6 +236,16 @@ impl TemplateMatcher {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -247,10 +282,12 @@ impl TemplateMatcher {
             last_method: None,
             last_input_size: (0, 0),
             last_template_size: (0, 0),
+            last_mask_size: (0, 0),
             last_result_size: (0, 0),
             uniform_buffer,
             input_buffer: None,
             template_buffer: None,
+            mask_buffer: None,
             result_buffer: None,
             staging_buffer: None,
             bind_group: None,
@@ -290,12 +327,34 @@ impl TemplateMatcher {
         })
     }
 
-    /// Slides a template over the input and scores the match at each point using the requested method.
-    /// To get the result of the matching, call [wait_for_result].
+    pub fn match_template_mask<'a>(
+        &mut self,
+        input: impl Into<Image<'a>>,
+        template: impl Into<Image<'a>>,
+        mask: impl Into<Image<'a>>,
+        method: MatchTemplateMethod,
+    ) {
+        self.match_template_inner(input, template, Some(mask), method);
+    }
+
     pub fn match_template<'a>(
         &mut self,
         input: impl Into<Image<'a>>,
         template: impl Into<Image<'a>>,
+        method: MatchTemplateMethod,
+    ) {
+        let none: Option<Image<'a>> = None;
+
+        self.match_template_inner(input, template, none, method);
+    }
+
+    /// Slides a template over the input and scores the match at each point using the requested method.
+    /// To get the result of the matching, call [wait_for_result].
+    pub fn match_template_inner<'a>(
+        &mut self,
+        input: impl Into<Image<'a>>,
+        template: impl Into<Image<'a>>,
+        mask: Option<impl Into<Image<'a>>>,
         method: MatchTemplateMethod,
     ) {
         if self.matching_ongoing {
@@ -310,8 +369,14 @@ impl TemplateMatcher {
             self.last_method = Some(method);
 
             let entry_point = match method {
-                MatchTemplateMethod::SumOfAbsoluteDifferences => "main_sad",
-                MatchTemplateMethod::SumOfSquaredDifferences => "main_ssd",
+                MatchTemplateMethod::SumOfAbsoluteDifferences => match mask {
+                    Some(_) => "main_sad_mask",
+                    None => "main_sad",
+                }
+                MatchTemplateMethod::SumOfSquaredDifferences => match mask {
+                    Some(_) => "main_ssd_mask",
+                    None => "main_ssd",
+                },
             };
 
             self.last_pipeline = Some(self.device.create_compute_pipeline(
@@ -347,6 +412,52 @@ impl TemplateMatcher {
             );
         }
 
+        if let Some(mask) = mask {
+            let mask = mask.into();
+            let mask_size: (u32, u32) = (mask.width, mask.height);
+            assert!(mask_size.0 == template.width, "Mask width must match template width");
+            assert!(mask_size.1 == template.height, "Mask height must match template height");
+            if self.mask_buffer.is_none() || self.last_mask_size != mask_size {
+                buffers_changed = true;
+            
+                self.last_mask_size = mask_size;
+            
+                self.mask_buffer = Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("mask_buffer"),
+                        contents: bytemuck::cast_slice(&mask.data),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    },
+                ));
+            } else {
+                self.queue.write_buffer(
+                    self.mask_buffer.as_ref().unwrap(),
+                    0,
+                    bytemuck::cast_slice(&mask.data),
+                );
+            }        
+        } else {
+            if self.mask_buffer.is_none() || self.last_mask_size != self.last_input_size {
+                buffers_changed = true;
+            
+                self.last_mask_size = self.last_input_size;
+            
+                self.mask_buffer = Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("mask_buffer"),
+                        contents: bytemuck::cast_slice(&vec![1.0; (input.width * input.height) as usize]),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    },
+                ));
+            } else {
+                self.queue.write_buffer(
+                    self.mask_buffer.as_ref().unwrap(),
+                    0,
+                    bytemuck::cast_slice(&vec![1.0; (input.width * input.height) as usize]),
+                );
+            }
+        }
+
         let template_size = (template.width, template.height);
         if self.template_buffer.is_none() || self.last_template_size != template_size {
             self.queue.write_buffer(
@@ -355,6 +466,8 @@ impl TemplateMatcher {
                 bytemuck::cast_slice(&[ShaderUniforms {
                     input_width: input.width,
                     input_height: input.height,
+                    mask_width: self.last_mask_size.0,
+                    mask_height: self.last_mask_size.1,
                     template_width: template.width,
                     template_height: template.height,
                 }]),
@@ -415,10 +528,14 @@ impl TemplateMatcher {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: self.result_buffer.as_ref().unwrap().as_entire_binding(),
+                        resource: self.mask_buffer.as_ref().unwrap().as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
+                        resource: self.result_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
                         resource: self.uniform_buffer.as_entire_binding(),
                     },
                 ],
