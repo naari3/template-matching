@@ -1,6 +1,6 @@
 [package]
 name = "template-matching"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Urho Laukkarinen <urho.laukkarinen@gmail.com>"]
 
@@ -13,7 +13,7 @@ keywords = ["gpu", "image"]
 categories = ["computer-vision"]
 
 [dependencies]
-wgpu = "0.16"
+wgpu = "0.17"
 pollster = "0.3"
 bytemuck = { version = "1.13", features = ["derive"] }
 image = { version = "0.24", optional = true }
