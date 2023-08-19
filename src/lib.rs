@@ -173,7 +173,10 @@ impl TemplateMatcher {
             backends: wgpu::Backends::all(),
             dx12_shader_compiler: Default::default(),
         });
+        Self::new_from_instance(instance)
+    }
 
+    pub fn new_from_instance(instance: wgpu::Instance) -> Self {
         let adapter = pollster::block_on(async {
             instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
